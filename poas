@@ -1,0 +1,375 @@
+import os
+import sys
+import subprocess
+import argparse
+import json
+import glob
+import warnings
+import numpy as np
+import pandas as pd
+
+# ===================================================================
+# 1.自动寻找最空闲的 GPU
+# ===================================================================
+def setup_best_gpu():
+    print("--- Searching for available GPU ---")
+    try:
+        # 查询所有 GPU 的剩余显存 (MB)
+        cmd = ['nvidia-smi', '--query-gpu=memory.free', '--format=csv,nounits,noheader']
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        if result.returncode != 0:
+            print("⚠️ nvidia-smi failed. Defaulting to GPU 0")
+            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+            return
+
+        # 解析输出
+        free_memory = [int(x) for x in result.stdout.strip().split('\n')]
+        best_gpu_index = int(np.argmax(free_memory))
+        max_free = free_memory[best_gpu_index]
+        
+        print(f"   Found GPUs (Free Memory): {free_memory}")
+        print(f"✅ Auto-selected Physical GPU: {best_gpu_index} (Free: {max_free} MB)")
+        
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(best_gpu_index)
+        
+    except Exception as e:
+        print(f"⚠️ GPU Selection failed: {e}. Defaulting to GPU 0")
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+# --- 执行选卡 ---
+setup_best_gpu()
+
+# ===================================================================
+# 2. 导入 PyTorch 和模型
+# ===================================================================
+print("--- Importing PyTorch and Libraries (This may take a moment) ---")
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import SimpleITK as sitk
+
+# 动态导入模型
+try:
+    import new_model_structure.Unet_Model_updata as SaNet_demo
+except ImportError:
+    print("[Critical Error] Cannot import 'new_model_structure.Unet_Model_updata'. Check sys.path.")
+    sys.exit(1)
+
+# --- 全局常量配置 ---
+PATCH_SIZE = (32, 32, 32)
+# 【优化】降低 Batch Size 以防止 OOM。3D数据非常吃显存，建议设为 4 或 8。
+BATCH_SIZE_INFERENCE = 4 
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# ===================================================================
+# 3. 模型包装器 & 辅助函数
+# ===================================================================
+class SegmentationModelWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, x):
+        outputs = self.model(x)
+        if isinstance(outputs, (list, tuple)):
+            return outputs[0]
+        return outputs
+
+def convert_to_single_channel(pred_probs):
+    return torch.argmax(pred_probs, dim=1)
+
+def RemoveSmallConnectedComponent(pred_sitk, rate=0.2):
+    cc_filter = sitk.ConnectedComponentImageFilter()
+    pred_cc = cc_filter.Execute(pred_sitk)
+    label_shape_filter = sitk.LabelShapeStatisticsImageFilter()
+    label_shape_filter.Execute(pred_cc)
+    num_labels = label_shape_filter.GetNumberOfLabels()
+    if num_labels <= 1:
+        return pred_sitk
+    sizes = [label_shape_filter.GetPhysicalSize(i) for i in range(1, num_labels + 1)]
+    max_size = max(sizes)
+    remove_labels = [i for i, size in enumerate(sizes, 1) if size < max_size * rate]
+    change_map = {label: 0 for label in remove_labels}
+    change_filter = sitk.ChangeLabelImageFilter()
+    change_filter.SetChangeMap(change_map)
+    pred_removed = change_filter.Execute(pred_cc)
+    return sitk.BinaryThreshold(pred_removed, lowerThreshold=1, upperThreshold=num_labels, insideValue=1, outsideValue=0)
+
+def evaluate_metrics(pred_sitk, label_sitk):
+    pred_sitk = sitk.Cast(pred_sitk, sitk.sitkInt64)
+    label_sitk = sitk.Cast(label_sitk, sitk.sitkInt64)
+    dice, hd95 = 0.0, float('inf')
+    try:
+        overlap = sitk.LabelOverlapMeasuresImageFilter()
+        overlap.Execute(pred_sitk, label_sitk)
+        dice = overlap.GetDiceCoefficient()
+    except Exception: pass
+    try:
+        hd = sitk.HausdorffDistanceImageFilter()
+        hd.Execute(pred_sitk, label_sitk)
+        hd95 = hd.GetHausdorffDistance()
+    except Exception: pass
+    return dice, hd95
+
+def extract_patches(volume_shape, patch_size):
+    coords = []
+    for z in range(0, volume_shape[0] - patch_size[0] + 1, patch_size[0]):
+        for y in range(0, volume_shape[1] - patch_size[1] + 1, patch_size[1]):
+            for x in range(0, volume_shape[2] - patch_size[2] + 1, patch_size[2]):
+                coords.append((z, y, x))
+    return coords
+
+def _ensure_3d_np(arr): return arr[None, ...] if arr.ndim == 2 else arr
+def _euclid_mm(p1, p2): return float(np.linalg.norm(p1 - p2))
+
+def shap_centroid_metrics(img_sitk, label_sitk, coords, patch_size, shap_scores, radius_mm=5.0):
+    img_np = _ensure_3d_np(sitk.GetArrayFromImage(img_sitk))
+    label_np = _ensure_3d_np(sitk.GetArrayFromImage(label_sitk))
+    
+    fg = (label_np > 0).astype(np.float32)
+    if fg.sum() == 0: return None
+    
+    # GT Centroid
+    z, y, x = np.indices(fg.shape)
+    tot = fg.sum()
+    label_c_zyx = (float((z * fg).sum()/tot), float((y * fg).sum()/tot), float((x * fg).sum()/tot))
+    
+    def idx2phys(idx): 
+        return np.array(img_sitk.TransformContinuousIndexToPhysicalPoint((idx[2], idx[1], idx[0])), dtype=np.float64)
+    
+    label_c_phys = idx2phys(label_c_zyx)
+    
+    # SHAP Mask Construction
+    shap_mask = np.zeros_like(label_np, dtype=np.uint8)
+    # 只选择对结果产生负面影响（即重要）的 Patch
+    selected_idx = [i for i, s in enumerate(shap_scores) if s < 0.0] 
+    dz, dy, dx = patch_size
+    patch_centers_phys = []
+    
+    for i in selected_idx:
+        cz, cy, cx = coords[i]
+        shap_mask[cz:cz+dz, cy:cy+dy, cx:cx+dx] = 1
+        pc_zyx = (cz + dz/2.0, cy + dy/2.0, cx + dx/2.0)
+        patch_centers_phys.append(idx2phys(pc_zyx))
+
+    if shap_mask.sum() == 0:
+        return None
+
+    # SHAP Centroid
+    sz, sy, sx = np.indices(shap_mask.shape)
+    stot = shap_mask.sum()
+    shap_c_zyx = (float((sz * shap_mask).sum()/stot), float((sy * shap_mask).sum()/stot), float((sx * shap_mask).sum()/stot))
+    shap_c_phys = idx2phys(shap_c_zyx)
+    
+    shap_to_label_dist = _euclid_mm(shap_c_phys, label_c_phys)
+
+    # Coverage Approximation
+    D, H, W = label_np.shape
+    origin, spacing = np.array(img_sitk.GetOrigin()), np.array(img_sitk.GetSpacing())
+    r_pix = int(radius_mm / min(spacing)) + 2
+    z_min, z_max = max(0, int(label_c_zyx[0]-r_pix)), min(D, int(label_c_zyx[0]+r_pix))
+    y_min, y_max = max(0, int(label_c_zyx[1]-r_pix)), min(H, int(label_c_zyx[1]+r_pix))
+    x_min, x_max = max(0, int(label_c_zyx[2]-r_pix)), min(W, int(label_c_zyx[2]+r_pix))
+    
+    sphere_intersection = 0
+    sphere_total = 0
+    for z in range(z_min, z_max):
+        for y in range(y_min, y_max):
+            for x in range(x_min, x_max):
+                pt = idx2phys((z,y,x))
+                dist = _euclid_mm(pt, label_c_phys)
+                if dist <= radius_mm:
+                    sphere_total += 1
+                    if shap_mask[z,y,x] == 1:
+                        sphere_intersection += 1
+    
+    coverage = sphere_intersection / sphere_total if sphere_total > 0 else 0.0
+
+    dists_to_label = [float(np.linalg.norm(p - label_c_phys)) for p in patch_centers_phys]
+    dists_to_shap_c = [float(np.linalg.norm(p - shap_c_phys)) for p in patch_centers_phys]
+    
+    return {
+        "coverage_on_label_centroid_sphere": coverage,
+        "shap_union_centroid_to_label_centroid_mm": shap_to_label_dist,
+        "per_patch_dist_stats_to_label_mm": {"mean": np.mean(dists_to_label) if dists_to_label else 0, "std": np.std(dists_to_label) if dists_to_label else 0},
+        "mean_dispersion_mm": np.mean(dists_to_shap_c) if dists_to_shap_c else 0,
+        "std_dispersion_mm": np.std(dists_to_shap_c) if dists_to_shap_c else 0
+    }
+
+# ===================================================================
+# 4. 单病例处理流程
+# ===================================================================
+def process_single_case(img_path, label_path, model, save_dir, radius_mm):
+    # 【显存优化】每个病例开始前清理显存
+    torch.cuda.empty_cache()
+    
+    case_id = os.path.basename(os.path.dirname(img_path))
+    
+    # 读取图像
+    img_sitk_orig = sitk.ReadImage(img_path, sitk.sitkFloat32)
+    label_sitk_orig = sitk.ReadImage(label_path, sitk.sitkUInt8)
+    
+    # 预处理 (Rescale 0-255)
+    img_sitk_rescaled = sitk.RescaleIntensity(img_sitk_orig, outputMinimum=0, outputMaximum=255)
+    img_np = sitk.GetArrayFromImage(img_sitk_rescaled).astype(np.float32)
+    
+    target_shape = (128, 64, 64)
+    if img_np.shape != target_shape:
+        print(f"  [Skip] Shape mismatch: {img_np.shape} != {target_shape}")
+        return None
+
+    img_tensor = torch.from_numpy(img_np).unsqueeze(0).unsqueeze(0).cuda()
+    
+    with torch.no_grad():
+        output = model(img_tensor)
+        probs = F.softmax(output, dim=1)
+        pred_label = convert_to_single_channel(probs)
+    
+    pred_sitk_base = sitk.GetImageFromArray(pred_label.cpu().numpy().squeeze().astype(np.uint8))
+    pred_sitk_base.CopyInformation(img_sitk_orig)
+    
+    label_sitk_bin = sitk.GetImageFromArray((sitk.GetArrayFromImage(label_sitk_orig) > 0).astype(np.uint8))
+    label_sitk_bin.CopyInformation(img_sitk_orig)
+    
+    base_dice, base_hd95 = evaluate_metrics(pred_sitk_base, label_sitk_bin)
+    
+    if base_dice < 0.05:
+        print(f"  [Skip] Baseline Dice too low ({base_dice:.4f})")
+        return None
+
+    # poas Analysis
+    coords = extract_patches(img_np.shape, PATCH_SIZE)
+    shap_dice_deltas = []
+    
+    dz, dy, dx = PATCH_SIZE
+    total_patches = len(coords)
+    
+    # Batch 处理
+    for i in range(0, total_patches, BATCH_SIZE_INFERENCE):
+        batch_coords = coords[i : min(i + BATCH_SIZE_INFERENCE, total_patches)]
+        batch_inputs = []
+        
+        for (z, y, x) in batch_coords:
+            masked_vol = img_np.copy()
+            masked_vol[z:z+dz, y:y+dy, x:x+dx] = 0.0
+            batch_inputs.append(masked_vol)
+        
+        # 转换为 Tensor
+        batch_tensor = torch.from_numpy(np.array(batch_inputs)).unsqueeze(1).cuda()
+        
+        try:
+            with torch.no_grad():
+                outputs = model(batch_tensor)
+                probs_batch = F.softmax(outputs, dim=1)
+                preds_batch = torch.argmax(probs_batch, dim=1).cpu().numpy().astype(np.uint8)
+            
+            for pred_arr in preds_batch:
+                pred_sitk_masked = sitk.GetImageFromArray(pred_arr)
+                pred_sitk_masked.CopyInformation(img_sitk_orig)
+                d, _ = evaluate_metrics(pred_sitk_masked, label_sitk_bin)
+                shap_dice_deltas.append(d - base_dice)
+                
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"\n[Warning] OOM during batch inference. Reducing batch size and retrying...")
+                torch.cuda.empty_cache()
+                return None
+            else:
+                raise e
+            
+        print(f"\r  > SHAP: {min(i + BATCH_SIZE_INFERENCE, total_patches)}/{total_patches}", end="")
+    
+    print("") # Newline
+
+    metrics_dice = shap_centroid_metrics(img_sitk_orig, label_sitk_orig, coords, PATCH_SIZE, np.array(shap_dice_deltas), radius_mm)
+    if metrics_dice is None: return None
+
+    # 后处理指标
+    pred_post = RemoveSmallConnectedComponent(pred_sitk_base)
+    post_dice, post_hd95 = evaluate_metrics(pred_post, label_sitk_bin)
+
+    result_dict = {
+        "case_id": case_id,
+        "dice_baseline": base_dice,
+        "hd95_baseline": base_hd95,
+        "dice_post": post_dice,
+        "dice_shap_coverage": metrics_dice["coverage_on_label_centroid_sphere"],
+        "dice_shap_dist": metrics_dice["shap_union_centroid_to_label_centroid_mm"],
+        "dice_shap_dispersion": metrics_dice["mean_dispersion_mm"],
+    }
+    
+    os.makedirs(save_dir, exist_ok=True)
+    with open(os.path.join(save_dir, "metrics.json"), "w") as f:
+        json.dump(result_dict, f, indent=4)
+        
+    return result_dict
+
+def analyze_results(all_results, save_dir):
+    df = pd.DataFrame(all_results)
+    df.to_csv(os.path.join(save_dir, "summary.csv"), index=False)
+    print(f"Summary saved to {save_dir}/summary.csv")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--root_dir', type=str, required=True)
+    parser.add_argument('--model_path', type=str, required=True)
+    parser.add_argument('--save_dir', type=str, default='./analysis_output')
+    parser.add_argument('--radius_mm', type=float, default=5.0)
+    args = parser.parse_args()
+
+    print(f"Current Logical Device: {torch.cuda.current_device()}")
+    print(f"Current Device Name: {torch.cuda.get_device_name(0)}")
+
+    channel_num = [64, 128, 256, 512, 512] 
+    alpha_list = [0.90, 0.90, 0.80, 0.75, 0.75]
+    
+    print(f"Loading FSSANet_V3...")
+    raw_model = SaNet_demo.FSSANet_V3(
+        list_ch=channel_num, 
+        alpha_list=alpha_list, 
+        in_channels=1, 
+        out_channels=2, 
+        deep_supervision=True
+    )
+    
+    state_dict = torch.load(args.model_path, map_location='cuda:0')
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        name = k.replace("module.", "")
+        new_state_dict[name] = v
+    
+    try:
+        raw_model.load_state_dict(new_state_dict, strict=True)
+    except Exception:
+        raw_model.load_state_dict(new_state_dict, strict=False)
+    
+    model = SegmentationModelWrapper(raw_model).cuda().eval()
+
+    case_dirs = sorted(glob.glob(os.path.join(args.root_dir, '*', '*')))
+    print(f"Found {len(case_dirs)} potential cases.")
+    
+    results = []
+    for case_dir in case_dirs:
+        img_path = os.path.join(case_dir, 'data_crop.nii')
+        label_path = os.path.join(case_dir, 'label_new.nii')
+        
+        if os.path.exists(img_path) and os.path.exists(label_path):
+            try:
+                case_save_dir = os.path.join(args.save_dir, os.path.basename(os.path.dirname(case_dir)), os.path.basename(case_dir))
+                res = process_single_case(img_path, label_path, model, case_save_dir, args.radius_mm)
+                if res: results.append(res)
+            except Exception as e:
+                print(f"[Error] Failed case {case_dir}: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    if results:
+        analyze_results(results, args.save_dir)
+"""
+python /home/yons/xv/net_snz/run_shap_analysis_fassnet.py \
+    --root_dir /home/yons/xv/net_snz/split_ID_data_all_purify/High_Quality_Data_All/test \
+    --model_path /home/yons/xv/net_snz/ModelSet_new2/xv_930_flexible_3.pth \
+    --save_dir /home/yons/xv/net_snz/analysis_output_fassnet
+"""
