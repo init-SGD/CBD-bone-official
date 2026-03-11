@@ -1,0 +1,166 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from new_model_structure.CPCA3dNew1 import CPCABlock3D
+# from swin_Trans3D import SwinTransformer3D
+from ModeStructureSet.FFC import FastFourierConvolution
+
+class SynergisticConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, alpha):
+        super(SynergisticConvBlock, self).__init__()
+        if in_channels != out_channels:
+            self.ffc1 = FastFourierConvolution(in_channels, out_channels, alpha_in=alpha, alpha_out=1-alpha, kernel_size=3, padding_type="reflect")
+        else:
+            self.ffc1 = FastFourierConvolution(in_channels, out_channels, alpha_in=alpha, alpha_out=1-alpha, kernel_size=3, padding_type="reflect")
+
+        self.bn1 = nn.BatchNorm3d(out_channels)
+        self.relu1 = nn.ReLU(inplace=False)
+        
+        self.cpca = CPCABlock3D(out_channels, out_channels)
+        
+        self.ffc2 = FastFourierConvolution(out_channels, out_channels, alpha_in=alpha, alpha_out=1-alpha, kernel_size=3, padding_type="reflect")
+        self.bn2 = nn.BatchNorm3d(out_channels)
+        self.relu2 = nn.ReLU(inplace=False)
+
+        self.shortcut = nn.Identity()
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=1)
+
+    def forward(self, x):
+        shortcut = self.shortcut(x)
+        
+        x = self.ffc1(x)
+        x = self.bn1(x)
+        x = self.relu1(x)
+        
+        x_att = self.cpca(x)
+        x = x + x_att
+        
+        x = self.ffc2(x)
+        x = self.bn2(x)
+        
+        x += shortcut
+        x = self.relu2(x)
+        
+        return x
+
+
+class SAM_Bottleneck(nn.Module):
+    def __init__(self, in_channels, mid_channels, alpha):
+        super(SAM_Bottleneck, self).__init__()
+        
+        self.conv_in = nn.Sequential(
+            nn.Conv3d(in_channels, mid_channels, kernel_size=1, bias=False),
+            nn.BatchNorm3d(mid_channels),
+            nn.ReLU(inplace=False)
+        )
+
+        # 分支1: 空间精炼路径
+        self.spatial_path = CPCABlock3D(mid_channels, mid_channels)
+
+        # 分支2: 频率上下文路径
+        self.frequency_path = FastFourierConvolution(
+            mid_channels, mid_channels, alpha_in=alpha, alpha_out=1-alpha
+        )
+
+        self.conv_out = nn.Sequential(
+            nn.Conv3d(mid_channels * 2, in_channels, kernel_size=1, bias=False),
+            nn.BatchNorm3d(in_channels)
+        )
+        
+        self.relu_out = nn.ReLU(inplace=False)
+
+    def forward(self, x):
+        residual = x
+
+        x_conv = self.conv_in(x)
+
+        x_spatial = self.spatial_path(x_conv)
+        x_frequency = self.frequency_path(x_conv)
+
+        x_agg = torch.cat([x_spatial, x_frequency], dim=1)
+        x_fused = self.conv_out(x_agg)
+
+        out = self.relu_out(x_fused + residual)
+
+        return out
+
+class FSSANet_V3(nn.Module):
+    def __init__(self, list_ch, alpha_list, in_channels=1, out_channels=2, deep_supervision=True):
+        super(FSSANet_V3, self).__init__()
+        
+        self.deep_supervision = deep_supervision
+
+        # Encoder 
+        self.encoder1 = SynergisticConvBlock(in_channels, list_ch[0], alpha_list[0])
+        self.encoder2 = SynergisticConvBlock(list_ch[0], list_ch[1], alpha_list[1])
+        self.encoder3 = SynergisticConvBlock(list_ch[1], list_ch[2], alpha_list[2])
+        self.encoder4 = SynergisticConvBlock(list_ch[2], list_ch[3], alpha_list[3])
+        self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
+
+        # Bottleneck: 
+        self.bottleneck = SAM_Bottleneck(
+            in_channels=list_ch[3], 
+            mid_channels=list_ch[3] // 2, 
+            alpha=alpha_list[4] 
+        )
+
+        # Decoder 
+        self.up4 = nn.ConvTranspose3d(list_ch[3], list_ch[2], kernel_size=2, stride=2)
+        self.decoder4 = SynergisticConvBlock(list_ch[3] + list_ch[2], list_ch[2], alpha_list[2])
+        
+        self.up3 = nn.ConvTranspose3d(list_ch[2], list_ch[1], kernel_size=2, stride=2)
+        self.decoder3 = SynergisticConvBlock(list_ch[2] + list_ch[1], list_ch[1], alpha_list[1])
+        
+        self.up2 = nn.ConvTranspose3d(list_ch[1], list_ch[0], kernel_size=2, stride=2)
+        self.decoder2 = SynergisticConvBlock(list_ch[1] + list_ch[0], list_ch[0], alpha_list[0])
+
+        self.up1 = nn.ConvTranspose3d(list_ch[0], list_ch[0], kernel_size=2, stride=2)
+        self.decoder1 = SynergisticConvBlock(list_ch[0] + list_ch[0], list_ch[0], alpha_list[0])
+
+        # Final output layer & Deep Supervision 
+        self.final_conv = nn.Conv3d(list_ch[0], out_channels, kernel_size=1)
+        if self.deep_supervision:
+            self.ds_out3 = nn.Conv3d(list_ch[1], out_channels, kernel_size=1)
+            self.ds_out2 = nn.Conv3d(list_ch[0], out_channels, kernel_size=1)
+
+    def forward(self, x):
+        # Encoder path 
+        e1 = self.encoder1(x)
+        p1 = self.pool(e1)
+        e2 = self.encoder2(p1)
+        p2 = self.pool(e2)
+        e3 = self.encoder3(p2)
+        p3 = self.pool(e3)
+        e4 = self.encoder4(p3)
+        p4 = self.pool(e4)
+
+        # Bottleneck
+        bottleneck = self.bottleneck(p4)
+
+        # Decoder path 
+        d4 = self.up4(bottleneck) 
+        d4 = torch.cat([e4, d4], dim=1)
+        d4 = self.decoder4(d4)
+        
+        d3 = self.up3(d4)
+        d3 = torch.cat([e3, d3], dim=1)
+        d3 = self.decoder3(d3)
+        
+        d2 = self.up2(d3)
+        d2 = torch.cat([e2, d2], dim=1)
+        d2 = self.decoder2(d2)
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([e1, d1], dim=1)
+        d1 = self.decoder1(d1)
+        
+        out = self.final_conv(d1)
+        
+        # Deep Supervision Logic 
+        if self.deep_supervision and self.training:
+            ds_out3_up = F.interpolate(self.ds_out3(d3), size=out.shape[2:], mode='trilinear', align_corners=False)
+            ds_out2_up = F.interpolate(self.ds_out2(d2), size=out.shape[2:], mode='trilinear', align_corners=False)
+            return [out, ds_out2_up, ds_out3_up]
+        else:
+            return out
