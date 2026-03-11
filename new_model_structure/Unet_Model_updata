@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from new_model_structure.CPCA3dNew1 import CPCABlock3D
 # from swin_Trans3D import SwinTransformer3D
-from ModeStructureSet.FFC import FastFourierConvolution
+from FFC import FastFourierConvolution
 
 class SynergisticConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, alpha):
