@@ -1,10 +1,3 @@
-'''
-info:
-    author : <wkx>
-    email  : <1244147811@qq.com>
-    date   : 2024-05-07
-    desc   : config.py arguments settings
-'''
 batch_size = 2
 crop_batch_size = 1
 epochs = 200
@@ -16,5 +9,6 @@ number_gpu = 2
 num_classes = 2
 
 is_load_pre_model = False
+
 
 max_samples=None
